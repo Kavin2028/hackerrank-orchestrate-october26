@@ -13,7 +13,11 @@ for path in (root/'code').rglob('*'):
     if path.suffix.lower() in allowed: files.append(path)
 with ZipFile(root/'code.zip','w',ZIP_DEFLATED) as z:
     for path in sorted(files): z.write(path,path.relative_to(root).as_posix())
+    # The submission contract requires these exact archive-root paths.
+    for name in ('evaluation_report.md','usage_report.md'):
+        z.write(root/'code/evaluation'/name,'evaluation/'+name)
 with ZipFile(root/'code.zip') as z:
     assert z.testzip() is None
     assert not any(name.startswith('dataset/') for name in z.namelist())
+    assert all('evaluation/'+name in z.namelist() for name in ('evaluation_report.md','usage_report.md'))
     print('Packaged',len(z.namelist()),'files in',root/'code.zip')

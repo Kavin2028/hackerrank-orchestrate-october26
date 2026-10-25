@@ -3,6 +3,8 @@ import sys
 import json
 import subprocess
 import time
+import hashlib
+from datetime import datetime, timezone
 from collections import Counter
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -18,14 +20,23 @@ def validate(predictions, requests, dataset):
     by_id={r['case_id']:r for r in requests}
     fields={'step_no','phase','system_id','resource_id','operation','state','evidence_id'}
     for row in predictions:
-        cid=row['case_id']; status=row['deletion_status']; steps=json.loads(row['steps_json'])
+        cid=row['case_id']; status=row['deletion_status']
+        if set(row)!={'case_id','deletion_status','steps_json'}: errors.append(cid+': CSV schema')
+        try: steps=json.loads(row['steps_json'])
+        except (ValueError,TypeError): errors.append(cid+': malformed JSON'); continue
+        if not isinstance(steps,list): errors.append(cid+': JSON is not an array'); continue
         if status not in ('COMPLETE','INCOMPLETE','NOT_APPLICABLE'): errors.append(cid+': invalid status')
         if status=='NOT_APPLICABLE' and steps: errors.append(cid+': unauthorized steps')
         if status!='NOT_APPLICABLE' and not steps: review.append(cid+': no linked state evidence; conservative INCOMPLETE without an inventable resource plan')
         previous=None
         for n,s in enumerate(steps,1):
-            if set(s)!=fields or s['step_no']!=n: errors.append(cid+': schema/numbering')
+            if not isinstance(s,dict) or set(s)!=fields: errors.append(cid+': step schema'); continue
+            if type(s['step_no']) is not int or s['step_no']!=n: errors.append(cid+': numbering')
+            if not all(isinstance(s[k],str) for k in fields-{'step_no'}): errors.append(cid+': field type'); continue
             if s['operation'] not in STATES or s['state']!=STATES.get(s['operation']): errors.append(cid+': operation/state')
+            if s['phase'] not in PHASES or s['operation'] not in OP_GROUPS[PHASES.index(s['phase'])]:
+                errors.append(cid+': phase/operation mismatch'); continue
+            if not s['system_id'] or not s['resource_id']: errors.append(cid+': empty resource/system')
             phase=PHASES.index(s['phase']); key=(phase,OP_GROUPS[phase].index(s['operation']),s['system_id'],s['resource_id'])
             if previous is not None and previous>key: errors.append(cid+': ordering')
             previous=key
@@ -36,9 +47,11 @@ def validate(predictions, requests, dataset):
     return errors,review
 
 def main():
+    started=datetime.now(timezone.utc).isoformat()
     start=time.perf_counter(); a=Auditor(ROOT/'dataset')
     requests=rows(ROOT/'dataset/deletion_requests.csv'); full=a.run(requests); write_output(ROOT/'output.csv',full)
     elapsed=time.perf_counter()-start
+    output_hash=hashlib.sha256((ROOT/'output.csv').read_bytes()).hexdigest()
     full_diagnostics=list(a.diagnostics); a.diagnostics=[]
     sample=a.run(rows(ROOT/'dataset/sample_deletion_requests.csv'))
     expected={r['case_id']:r for r in rows(ROOT/'dataset/sample_output.csv')}
@@ -56,12 +69,21 @@ def main():
         if actual!=gold or not status_ok:
             failures.append(f"- {r['case_id']}: status {'correct' if status_ok else 'incorrect'}; predicted {len(actual)} steps, expected {len(gold)}; exact-step matches {len(aa&bb)}.")
     errors,review=validate(full,requests,ROOT/'dataset')
+    if len(full)!=518: errors.append('Expected exactly 518 output rows')
+    for prediction in full:
+        for s in json.loads(prediction['steps_json']):
+            if not s['evidence_id']: continue
+            proof=a.case_proofs[prediction['case_id']]
+            if not any((o.resource,o.system,o.evidence,o.state)==(s['resource_id'],s['system_id'],s['evidence_id'],s['state']) for o in proof):
+                errors.append(prediction['case_id']+': citation does not establish selected resource state')
     result=subprocess.run([sys.executable,'-m','unittest','discover','-s',str(Path(__file__).parent),'-p','test_*.py','-v'],capture_output=True,text=True)
     report=f'''# Evaluation report
 
+Final run started UTC: {started}. Output SHA-256: {output_hash}.
+
 ## Reproduction
 
-Run `python code/evaluation/main.py` from the repository root. This runs the full dataset, evaluates the 32 public samples, validates the submission contract, and runs six independent synthetic tests. Public expected outputs are read only here, never by the predictor. Hidden answer accuracy is unknown.
+Run `python code/evaluation/main.py` from the repository root. This runs the full dataset, evaluates the 32 public samples, validates the submission contract, and runs the independent synthetic regression suite. Public expected outputs are read only here, never by the predictor. Hidden answer accuracy is unknown. Passing structure validation does not prove complete evidence discovery.
 
 ## Measured public-sample results
 
@@ -89,12 +111,20 @@ Run `python code/evaluation/main.py` from the repository root. This runs the ful
 4. A replica containing a profile defeats an absent primary at the same snapshot time.
 5. A tombstone may keep its stable reference but must remove direct identifiers and email hashes.
 6. Restore blocking must precede record deletion; future actions have blank evidence IDs.
+7. An older surviving replica remains a violation after a newer primary absence; its own later removal resolves it.
+8. An absent required retained record cannot yield COMPLETE or a false evidence-backed presence check.
+9. A successful deletion claim alone cannot prove absence.
+10. Unavailable identity history, future captures, and future catalog links cannot establish an earlier state.
+11. An unrelated inventory batch cannot clear records from another subject batch.
+12. Nested identifier lists and multilingual negation are handled explicitly; absent analytics do not expose identifiers.
 
 ## Failures and improvements
 
 Initial parsing missed syslog, pipe, cloud, and application log envelopes. The parser now normalizes each, correlates traces, and recognizes readback, PII scans, heartbeat, and restore checks. It distinguishes support attachments and secondary contact indexes from shared support messages. Screenshot parsing scopes identifiers to detail panels to reduce unrelated-customer matches. Multilingual deletion requests and explicit non-deletion requests are handled separately.
 
-Exact step coverage remains incomplete. In particular, absent or fully anonymized records can have no recoverable subject link in evidence available before the cutoff. The implementation does not invent identifiers or copy canonical answers to fill these gaps. Some selected records may still be associated too broadly in complex business artifacts. Cases without any linked state evidence are conservatively INCOMPLETE with an empty step array, flagged for manual review; their missing resource plan means they do not fully satisfy the semantic output contract. Policy application is deterministic by category; complex retention conditions and cross-source conflicts need further semantic review. This is a runnable baseline, not a claim of hidden-test correctness or a fully verified deletion audit.
+The two documented false-COMPLETE defects have regression coverage and are fixed: each physical copy has its own timeline, and missing required retained records force INCOMPLETE. Identity aliases are filtered by availability; snapshot absence is scoped to evidenced subject batches; parent-resource links are preserved. The catalog and screenshot now establish the attachment for case_61. OCR caches include content hashes. Both exact archive-root evaluation report paths are packaged.
+
+Expected-answer equivalence remains unachieved. Absent or fully anonymized records sometimes have no recovered subject link before audit_at. The implementation does not infer IDs from case numbers, correlate unrelated operations by timing, invent missing evidence, or copy canonical answers. Older still-evidenced records for the same subject can add steps omitted by public expected plans. Missing mandatory retained/shared records require recovery, which the permitted operation vocabulary cannot express; these cases receive diagnostics and future checks rather than false verification. Retention expiry alone does not authorize deletion without an applicable rule. Some business documents lack grounded system/resource catalog mappings. See code/BLOCKERS.md for concrete gaps. No hidden accuracy or full semantic completeness is claimed.
 
 ### Public sample mismatches
 
@@ -117,7 +147,7 @@ Exact step coverage remains incomplete. In particular, absent or fully anonymize
     (Path(__file__).parent/'evaluation_report.md').write_text(report,encoding='utf-8')
     usage=f'''# Final full-dataset usage report
 
-The final run processed {len(requests)} requests and generated root-level output.csv in {elapsed:.2f} seconds (with cached OCR extraction).
+Run started UTC: {started}. The final run processed {len(requests)} requests and generated root-level output.csv in {elapsed:.2f} seconds. Output SHA-256: {output_hash}. Public-sample evaluation follows this run and is excluded from its accounting.
 
 ## Models and providers
 
@@ -131,12 +161,15 @@ Image text extraction uses Microsoft Windows.Media.Ocr on Windows, or locally in
 - Average tokens per request: 0.
 - Estimated total API cost: USD 0.00.
 - Estimated API cost per request: USD 0.00.
-- OCR images read from local cache on this run: {len(list((ROOT/'tmp/ocr').glob('*.txt')))}. Cache misses invoke local OCR; OCR has no token billing.
+- OCR images read from content-addressed cache on this run: {a.ocr_hits}; fresh OCR calls: {a.ocr_calls}. OCR has no token billing.
 - Overall totals are identical because no paid model API is used. Local compute/electricity cost is not measured.
 
 Development of the code used Codex (gpt-6.1-sol). Development-session token usage is separate from final pipeline inference and is not measured by this program; it is not represented as zero. No credentials are needed for the submitted pipeline.
 '''
     (Path(__file__).parent/'usage_report.md').write_text(usage,encoding='utf-8')
+    write_output(ROOT/'tmp/sample_predictions.csv',sample)
+    metrics={'started_utc':started,'output_sha256':output_hash,'requests':len(full),'sample_status_correct':statuses,'sample_exact':exact,'samples':len(sample),'validation_errors':errors,'review':review,'diagnostics':full_diagnostics,'seconds':elapsed,'ocr_cache_hits':a.ocr_hits,'ocr_calls':a.ocr_calls,'test_exit_code':result.returncode}
+    (ROOT/'tmp/final_run_metrics.json').write_text(json.dumps(metrics,indent=2),encoding='utf-8')
     print(f'Public samples: status {statuses}/32; exact {exact}/32. Validation errors: {len(errors)}. Review rows: {len(review)}.')
     print(result.stderr)
     if errors or result.returncode: raise SystemExit(1)
